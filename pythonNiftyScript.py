@@ -1,35 +1,4 @@
 
-"""Image reconstruction from raw PET data"""
-import logging
-import os
-import time
-from collections import namedtuple
-from collections.abc import Iterable
-from numbers import Real
-
-import cuvec as cu
-import numpy as np
-import scipy.ndimage as ndi
-from tqdm.auto import trange
-
-from niftypet import nimpa
-
-# resources contain isotope info
-import sys
-# caution: path[0] is reserved for script path (or '' in REPL)
-sys.path.insert(1, '/NiftyPETThings/NIPET/niftypet/nipet/prj')
-
-from .. import mmraux, mmrnorm, resources
-from .. img import mmrimg
-from .. lm.mmrhist import randoms
-from .. sct import vsm
-from . import petprj
-
-
-"""
-petprj.fprj()
-petprj.bprj()
-petprj.osem()
 """
 def reconstructionScript(
         datain, mumaps, hst, scanner_params, recmod=3, itr=4, fwhm=0., psf=None,
@@ -44,18 +13,19 @@ def reconstructionScript(
     #forward project from listmode
     muh, muo = mumaps
     # get the GPU version of the image dims
-    mus = mmrimg.convert2dev(muo + muh, Cnt)
+    Cnt = scanner_params['Cnt']
+    mus = convert2dev(muo + muh, Cnt)
 
-    psng = mmraux.remgaps(hst['psino'], txLUT, Cnt)
+    psng = remgaps(hst['psino'], txLUT, Cnt)
     asng = cu.zeros(psng.shape, dtype=np.float32)
-    print(asng)
+    log.info(asng)
     petprj.fprj(asng, cu.asarray(mus), txLUT, axLUT, np.array([-1], dtype=np.int32), Cnt, 1)
-    print(asng)
+    log.info(asng)
 
     #backproject from forward project
     return 0
 
-
+"""
 # imports & helper functions
 from __future__ import print_function, division
 from collections import OrderedDict
@@ -106,10 +76,55 @@ mu_o = nipet.obj_mumap(datain, mMRpars, outpath=opth, store=True)
 # create histogram
 mMRpars['Cnt']['BTP'] = 0
 m = nipet.mmrhist(datain, mMRpars, outpath=opth, store=True, use_stored=True)
-hst = mmrhist(datain, mMRpars, t0=t0, t1=t1)
+hst = m
 
-reconstructionScript(
-        datain=datain, mumaps=mumaps, hst=hst, scanner_params=mMRpars, recmod=3, itr=4, fwhm=0., psf=None,
+#try:  # needs HW mu-maps
+#    imscroll(mu_o['im'] + mu_h['im'], cmap='bone')  # title=r"$\mu$-map"
+#except:
+#    imscroll(mu_o['im'], cmap='bone')
+
+
+
+
+
+import plotext as plt
+import numpy
+#recon['im']
+#m['dsino']
+InitList = [x.tolist()[0] if type(x)==numpy.ndarray else x for x in mu_o['im']]
+
+plt.matrix_plot(InitList)
+plt.show()
+
+
+print(InitList)
+
+
+
+
+
+
+# sinogram index (<127 for direct sinograms, >=127 for oblique sinograms)
+#imscroll([m['psino'], m['dsino']],
+#         titles=["Prompt sinogram (%.3gM)" % (m['psino'].sum() / 1e6),
+#                 "Delayed sinogram (%.3gM)" % (m['dsino'].sum() / 1e6)],
+#         cmap='inferno',
+         #colorbars=[1]*2,
+#         fig=plt.figure(figsize=(9.5, 3.5), tight_layout=True, frameon=False));
+#axs = plt.gcf().axes
+#axs[-1].set_xlabel("bins")
+#[i.set_ylabel("angles") for i in axs]
+
+# built-in default: 14 subsets
+fcomment = f"_fwhm-{fwhm}_recon"
+outpath = path.join(opth, folderout)
+recon = glob(
+    f"{outpath}/PET/single-frame/a_t-*-*sec_itr-{itr}{fcomment}.nii.gz"
+)
+
+
+nipet.reconstructionScript(
+        datain=datain, mumaps=[mu_h['im'],mu_o['im']], hst=hst, scanner_params=mMRpars, recmod=3, itr=4, fwhm=0., psf=None,
         mask_radius=29., decay_ref_time=None, attnsino=None, sctsino=None, randsino=None,
         normcomp=None, emmskS=False, frmno='', fcomment='', outpath=None, fout=None,
         store_img=False, store_itr=None, ret_sinos=False
