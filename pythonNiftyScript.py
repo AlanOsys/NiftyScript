@@ -123,9 +123,10 @@ recon = glob(
 )
 
 
-nipet.reconstructionScript(
+recon = nipet.reconstructionScript(
         datain=datain, mumaps=[mu_h['im'],mu_o['im']], hst=hst, scanner_params=mMRpars, recmod=3, itr=4, fwhm=0., psf=None,
         mask_radius=29., decay_ref_time=None, attnsino=None, sctsino=None, randsino=None,
         normcomp=None, emmskS=False, frmno='', fcomment='', outpath=None, fout=None,
         store_img=False, store_itr=None, ret_sinos=False
     )
+print(recon)
