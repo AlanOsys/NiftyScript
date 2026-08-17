@@ -15,6 +15,7 @@ from ..img import mmrimg
 from ..lm.mmrhist import randoms
 from ..sct import vsm
 from . import petprj
+from .. import prjsig
 import cuvec as cu
 import numpy as np
 import scipy.ndimage as ndi
@@ -141,6 +142,36 @@ def Forward(image,muMaps,scanner_params,hst,attenuation=True):
     rsng = mmraux.putgaps(asng, txLUT, Cnt)
     return asng, rsng
 
+def SigForward(image, muMaps, scanner_params, hst, attenuation=True):
+    Cnt = scanner_params['Cnt']
+    txLUT = scanner_params['txLUT']
+    axLUT = scanner_params['axLUT']
+
+    # nsinos must be derived from Cnt, same as your working recon script
+    if Cnt['SPN'] == 1:
+        nsinos = Cnt['NSN1']
+    elif Cnt['SPN'] == 2:
+        nsinos = Cnt['NSN']
+    else:
+        raise ValueError(f"Unrecognised SPN: {Cnt['SPN']}")
+
+    image = np.array(image)
+    try:
+        ims = mmrimg.convert2dev(image, Cnt)
+    except Exception:
+        ims = image
+
+    isub = np.array([-1], dtype=np.int32)
+
+    # gap-free, projector-native shape — matches your working script's sino_shape
+    sinogramShape = (Cnt['NAW'], nsinos)
+    asng = cu.zeros(sinogramShape, dtype=np.float32)
+
+    prjsig.fprj(asng, cu.asarray(ims, dtype=np.float32), txLUT, axLUT,
+                isub, Cnt, attenuation)
+
+    return asng   # stay in Naw-space -- no putgaps
+
 def convDev(projected,Cnt):
     bimg = mmrimg.convert2e7(projected, Cnt)
     return bimg
@@ -229,6 +260,24 @@ def Back(sino,muMaps,scanner_params,hst):
     #vol = np.rot90(vol, 1, axes=(2,1)) # rotate each slice
     
     return img#vol
+
+def SigBack(sino, muMaps, scanner_params, hst):
+    Cnt = scanner_params['Cnt']
+    txLUT = scanner_params['txLUT']
+    axLUT = scanner_params['axLUT']
+    isub = np.array([-1], dtype=np.int32)
+
+    # Y before X -- matches im_shape convention used everywhere else
+    im_shape = (Cnt['SZ_IMY'], Cnt['SZ_IMX'], Cnt['SZ_IMZ'])
+    img = cu.zeros(im_shape, dtype=np.float32)
+
+    # sino is expected already in Naw-space (i.e. what SigForward returns) --
+    # no remgaps needed
+    prjsig.bprj(img, cu.asarray(sino, dtype=np.float32), txLUT, axLUT,
+                isub, Cnt, False)
+
+    img = convDev(img, Cnt)
+    return img
 #tmpsens = cu.ones((837,344,344),dtype=np.float32)
 #bksens = Back(tmpsens,)
 def getNormPara(datain,Cnt):
@@ -964,6 +1013,233 @@ def Scatter_BSREM_Updated(
  
 
     return pred
+
+
+
+
+def Signa_BSREM(
+    sinog,              # measured prompts, shape (Cnt['NAW'], nsinos)
+    nrmcmp,              # dict with Signa norm components, e.g. {'nrm': nrm, 'dtpu': dtpu}
+    muMaps,              # (mu_hardware, mu_object), Signa image grid
+    scanner_params,      # dict(Cnt=Cnt, txLUT=txLUT, axLUT=axLUT) from nipet.sigaux.init_sig
+    hst,
+    # Iteration control — identical to Scatter_BSREM_Updated
+    iterations: int = 100,
+    n_subsets:  int = 10,
+    randomsinp        = [],
+    scatterinp        = [],
+    pred              = None,
+    # BSREM-specific parameters — identical
+    beta:        float = 0.3,
+    gamma:       float = 2.0,
+    alpha_0:     float = 1.0,
+    alpha_decay: float = None,
+    delta_frac:  float = 1e-4,
+):
+    """
+    BSREM-RDP PET reconstruction for GE Signa data. Structural drop-in for
+    Scatter_BSREM_Updated — only how sinograms/normalisation/dead-time are
+    obtained and how forward/back projection is called has changed (Signa's
+    nipet.prjsig / nipet.sigaux path instead of mMR). BSREM-RDP update math
+    is unchanged.
+    Returns pred : CuVec array (Y, X, Z) float32 (Signa image-grid order).
+    """
+
+    # ── 0. Setup ──────────────────────────────────────────────────────────
+    sinogramShape = sinog.shape
+    print("Using sinogram shape:", sinogramShape)
+
+    Cnt, txLUT, axLUT = scanner_params['Cnt'], scanner_params['txLUT'], scanner_params['axLUT']
+
+    # NOTE: Signa image grid order, per your reconstruction script
+    im_shape = (Cnt['SZ_IMY'], Cnt['SZ_IMX'], Cnt['SZ_IMZ'])
+
+    if pred is None:
+        pred = cu.ones(im_shape, dtype=np.float32)
+
+    if len(randomsinp) == 0:
+        randoms = cu.zeros(sinog.shape)
+    else:
+        randoms = cu.asarray(randomsinp)
+
+    if len(scatterinp) == 0:
+        scatter = cu.zeros(sinog.shape)
+    else:
+        scatter = cu.asarray(scatterinp)
+
+    muh, muo = muMaps
+
+    # NOTE: Signa gives pre-generated norm/dead-time sinograms rather than
+    # mMR-style norm components + a runtime get_norm_sino() call — combine
+    # exactly as your read-in script does (nrm * dtpu):
+    nsng = nrmcmp['nrm'] * nrmcmp['dtpu']
+
+    # NOTE: no mmrimg.convert2dev() equivalent shown for Signa — plain combine:
+    mus = cu.asarray(muo + muh, dtype=np.float32)
+
+    # forward-project mu-map to get the attenuation sinogram
+    # (0 = TOF bin index / non-TOF, per your script's fprj signature)
+    fwd_mu = cu.zeros(sinog.shape, dtype=np.float32)
+    fwd_mu  = SigForward((pred), mus, scanner_params, hst, False)[1]#psf
+    fwd_mu_gaps = np.array(fwd_mu, dtype=np.float32)
+
+    fwhm = 2.5
+    # NOTE: verify these voxel-size keys against your Signa Cnt — PSF stays
+    # disabled below (same as Scatter_BSREM_Updated), so this is unused for now
+    SIGMA2FWHMmm = (8 * np.log(2))**0.5 * np.array([
+        Cnt.get('SZ_VOXY'), Cnt.get('SZ_VOXX', Cnt.get('SZ_VOXY')), Cnt.get('SZ_VOXZ')
+    ]) * 10
+    psf = functools.partial(gaussian_filter, sigma=fwhm / SIGMA2FWHMmm)
+
+    # NOTE: Signa FOV mask, per your reconstruction script
+    msk = Mask(Cnt)
+    pred[msk] = 0.0
+    nsng_fwd = nsng * fwd_mu_gaps
+
+    # ── 1. Interleaved subsets ────────────────────────────────────────────
+    # NOTE: sinog is NAW-flattened (bins*angles, nsinos) for Signa, not
+    # (nsinos, angles, bins) like mMR — reshape to expose the angle axis.
+    # VERIFY NSBINS/NSANGLES key names + ordering against your Cnt.
+    n_bins   = Cnt['NSBINS']
+    n_angles = Cnt['NSANGLES']
+    assert n_bins * n_angles == Cnt['NAW'], \
+        "NSBINS*NSANGLES != NAW -- check reshape order for your Signa Cnt"
+
+    def to_bab(x_naw):
+        return x_naw.reshape(n_bins, n_angles, -1)
+
+    def to_naw(x_bab):
+        return x_bab.reshape(Cnt['NAW'], -1)
+
+    interleaved = np.array([
+        a for s in range(n_subsets) for a in range(s, n_angles, n_subsets)
+    ])
+    subset_indices = [
+        np.sort(chunk) for chunk in np.array_split(interleaved, n_subsets)
+    ]
+    for s, idx in enumerate(subset_indices):
+        print(f"  Subset {s}: {len(idx)} angles, "
+              f"range [{idx.min()}, {idx.max()}]")
+
+    # ── 2. Pre-compute per-subset sensitivities ──────────────────────────
+    subset_sensitivities = []
+    for idx in subset_indices:
+        masked_nsng = np.zeros_like(nsng_fwd)
+        masked_bab = to_bab(masked_nsng)
+        masked_bab[:, idx, :] = to_bab(nsng_fwd)[:, idx, :]
+        masked_nsng = to_naw(masked_bab)
+
+        s_sub_arr = cu.zeros(im_shape, dtype=np.float32)
+        nipet.prjsig.bprj(s_sub_arr, cu.asarray(masked_nsng, dtype=np.float32),
+                           txLUT, axLUT, ISUB_DEFAULT, Cnt, sync=True)
+        s_sub = np.array(s_sub_arr)  #psf
+        s_sub[msk] = 0.0
+        subset_sensitivities.append(s_sub)
+
+    # ── 3. Additive correction — identical to Scatter_BSREM_Updated ────────
+    randoms  = div_nzer(randoms, nsng_fwd)
+    additive = (cu.asarray(randoms, dtype=np.float32)
+                + cu.asarray(scatter, dtype=np.float32))
+
+    # ── 4. BSREM-specific setup — identical ──────────────────────────────
+    if alpha_decay is None:
+        alpha_decay = float(n_subsets * iterations) / 3.0
+
+    global_subit = 0
+    print(f"\nSigna BSREM: {iterations} iters x {n_subsets} subsets"
+          f" | beta={beta}, gamma={gamma}"
+          f" | alpha_0={alpha_0}, alpha_decay={alpha_decay:.1f}")
+
+    # ── 5. Main reconstruction loop ───────────────────────────────────────
+    for i in range(iterations):
+
+        for s, idx in enumerate(subset_indices):
+
+            alpha = _alpha(global_subit, alpha_0, alpha_decay)
+            s_sub = subset_sensitivities[s]
+
+            # ── 5a. Forward projection ────────────────────────────────────
+            fwd_arr = cu.zeros(sinog.shape, dtype=np.float32)
+            nipet.prjsig.fprj(fwd_arr, cu.asarray(pred, dtype=np.float32),
+                               txLUT, axLUT, ISUB_DEFAULT, Cnt, 0, sync=True)
+            fwd = np.array(fwd_arr)  #psf
+            fwd += additive
+            fwd  = np.maximum(fwd, 1e-15)
+
+            # ── 5b. Subset likelihood gradient — identical logic ────────────
+            ratio = div_nzer(sinog, fwd)
+            masked_ratio = np.zeros_like(ratio)
+            masked_bab = to_bab(masked_ratio)
+            masked_bab[:, idx, :] = to_bab(ratio)[:, idx, :]
+            masked_ratio = to_naw(masked_bab)
+
+            bp_ratio_arr = cu.zeros(im_shape, dtype=np.float32)
+            nipet.prjsig.bprj(bp_ratio_arr, cu.asarray(masked_ratio, dtype=np.float32),
+                               txLUT, axLUT, ISUB_DEFAULT, Cnt, sync=True)
+            bp_ratio = np.array(bp_ratio_arr)  #psf
+
+            grad_L = bp_ratio - s_sub
+
+            # ── 5c. RDP prior gradient — identical ───────────────────────────
+            grad_R = gradient(pred, gamma, beta) / n_subsets
+
+            # ── 5d. EM preconditioner — identical ────────────────────────────
+            delta = max(float(delta_frac * float(pred.max())), 1e-8)
+            D_s = (pred + delta) / np.maximum(s_sub, 1e-15)
+            D_s[msk] = 0.0
+
+            # ── 5e. BSREM update — identical ──────────────────────────────────
+            pred = pred + alpha * D_s * (grad_L + grad_R)
+            pred = np.maximum(pred, 0.0)
+            pred[msk] = 0.0
+
+            global_subit += 1
+
+        # ── 6. Optional scatter re-estimation ────────────────────────────
+        if len(scatterinp) != 0:
+            # NOTE: no Signa Scatter() equivalent was provided — plug yours
+            # in here, or leave scatterinp fixed for the whole run.
+            raise NotImplementedError(
+                "Signa scatter re-estimation not implemented; provide a "
+                "Signa Scatter() equivalent or omit scatterinp."
+            )
+
+        print(f"\x1b[31m\"Iter {i+1:4d} | alpha={_alpha(global_subit, alpha_0, alpha_decay):.5f}"
+              f"| pred min/max/mean: {float(pred.min()):.4f} / {float(pred.max()):.4f} / {float(pred.mean()):.4f}\"\x1b[0m")
+
+    return pred
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ 
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 
