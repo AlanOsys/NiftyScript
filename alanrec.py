@@ -15,7 +15,7 @@ from ..img import mmrimg
 from ..lm.mmrhist import randoms
 from ..sct import vsm
 from . import petprj
-from .. import prjsig
+from ..prj_sig import prjsig
 import cuvec as cu
 import numpy as np
 import scipy.ndimage as ndi
@@ -142,35 +142,15 @@ def Forward(image,muMaps,scanner_params,hst,attenuation=True):
     rsng = mmraux.putgaps(asng, txLUT, Cnt)
     return asng, rsng
 
-def SigForward(image, muMaps, scanner_params, hst, attenuation=True):
-    Cnt = scanner_params['Cnt']
-    txLUT = scanner_params['txLUT']
-    axLUT = scanner_params['axLUT']
-
-    # nsinos must be derived from Cnt, same as your working recon script
-    if Cnt['SPN'] == 1:
-        nsinos = Cnt['NSN1']
-    elif Cnt['SPN'] == 2:
-        nsinos = Cnt['NSN']
-    else:
-        raise ValueError(f"Unrecognised SPN: {Cnt['SPN']}")
-
-    image = np.array(image)
-    try:
-        ims = mmrimg.convert2dev(image, Cnt)
-    except Exception:
-        ims = image
-
-    isub = np.array([-1], dtype=np.int32)
-
-    # gap-free, projector-native shape — matches your working script's sino_shape
+def SigForward(image, scanner_params, attenuation=True):
+    Cnt, txLUT, axLUT = scanner_params['Cnt'], scanner_params['txLUT'], scanner_params['axLUT']
+    nsinos = Cnt['NSN'] if Cnt['SPN'] == 2 else Cnt['NSN1']
     sinogramShape = (Cnt['NAW'], nsinos)
+    ims = cu.asarray(np.array(image), dtype=np.float32)
+    isub = np.array([-1], dtype=np.int32)
     asng = cu.zeros(sinogramShape, dtype=np.float32)
-
-    prjsig.fprj(asng, cu.asarray(ims, dtype=np.float32), txLUT, axLUT,
-                isub, Cnt, attenuation)
-
-    return asng   # stay in Naw-space -- no putgaps
+    prjsig.fprj(asng, ims, txLUT, axLUT, isub, Cnt, int(attenuation), sync=True)
+    return asng
 
 def convDev(projected,Cnt):
     bimg = mmrimg.convert2e7(projected, Cnt)
@@ -261,22 +241,13 @@ def Back(sino,muMaps,scanner_params,hst):
     
     return img#vol
 
-def SigBack(sino, muMaps, scanner_params, hst):
-    Cnt = scanner_params['Cnt']
-    txLUT = scanner_params['txLUT']
-    axLUT = scanner_params['axLUT']
+def SigBack(sino, scanner_params):
+    Cnt, txLUT, axLUT = scanner_params['Cnt'], scanner_params['txLUT'], scanner_params['axLUT']
     isub = np.array([-1], dtype=np.int32)
-
-    # Y before X -- matches im_shape convention used everywhere else
     im_shape = (Cnt['SZ_IMY'], Cnt['SZ_IMX'], Cnt['SZ_IMZ'])
     img = cu.zeros(im_shape, dtype=np.float32)
-
-    # sino is expected already in Naw-space (i.e. what SigForward returns) --
-    # no remgaps needed
-    prjsig.bprj(img, cu.asarray(sino, dtype=np.float32), txLUT, axLUT,
-                isub, Cnt, False)
-
-    img = convDev(img, Cnt)
+    sino_cu = cu.asarray(np.asarray(sino, dtype=np.float32))
+    prjsig.bprj(img, sino_cu, txLUT, axLUT, isub, Cnt, sync=True)
     return img
 #tmpsens = cu.ones((837,344,344),dtype=np.float32)
 #bksens = Back(tmpsens,)
@@ -1015,21 +986,28 @@ def Scatter_BSREM_Updated(
     return pred
 
 
-
+def SigMask(Cnt, rad=27.):
+    """
+    Signa FOV mask, using nipet.sigaux.get_cylinder (not mmrimg.get_cylinder,
+    which is mMR-specific and would silently produce a wrong-shaped/wrong-grid
+    mask here). rad=27 matches the value used in your working recon script.
+    """
+    from niftypet import nipet as _nipet  # local import to avoid altering module-level imports
+    msk = _nipet.sigaux.get_cylinder(
+        Cnt, rad=rad, xo=0, yo=0, unival=1, gpu_dim=True, mask=True)
+    return ~np.asarray(msk).astype(bool)   # invert: Mask() convention here is True = OUTSIDE FOV
 
 def Signa_BSREM(
     sinog,              # measured prompts, shape (Cnt['NAW'], nsinos)
     nrmcmp,              # dict with Signa norm components, e.g. {'nrm': nrm, 'dtpu': dtpu}
-    muMaps,              # (mu_hardware, mu_object), Signa image grid
+    muMaps,              # (mu_hardware, mu_object), RAW loader axis order (Z,Y,X)
     scanner_params,      # dict(Cnt=Cnt, txLUT=txLUT, axLUT=axLUT) from nipet.sigaux.init_sig
     hst,
-    # Iteration control — identical to Scatter_BSREM_Updated
     iterations: int = 100,
     n_subsets:  int = 10,
     randomsinp        = [],
     scatterinp        = [],
     pred              = None,
-    # BSREM-specific parameters — identical
     beta:        float = 0.3,
     gamma:       float = 2.0,
     alpha_0:     float = 1.0,
@@ -1038,10 +1016,9 @@ def Signa_BSREM(
 ):
     """
     BSREM-RDP PET reconstruction for GE Signa data. Structural drop-in for
-    Scatter_BSREM_Updated — only how sinograms/normalisation/dead-time are
-    obtained and how forward/back projection is called has changed (Signa's
-    nipet.prjsig / nipet.sigaux path instead of mMR). BSREM-RDP update math
-    is unchanged.
+    Scatter_BSREM_Updated -- only how sinograms/normalisation/dead-time are
+    obtained, how mu-maps are axis-corrected, and how forward/back
+    projection is called has changed. BSREM-RDP update math is unchanged.
     Returns pred : CuVec array (Y, X, Z) float32 (Signa image-grid order).
     """
 
@@ -1050,8 +1027,6 @@ def Signa_BSREM(
     print("Using sinogram shape:", sinogramShape)
 
     Cnt, txLUT, axLUT = scanner_params['Cnt'], scanner_params['txLUT'], scanner_params['axLUT']
-
-    # NOTE: Signa image grid order, per your reconstruction script
     im_shape = (Cnt['SZ_IMY'], Cnt['SZ_IMX'], Cnt['SZ_IMZ'])
 
     if pred is None:
@@ -1069,37 +1044,54 @@ def Signa_BSREM(
 
     muh, muo = muMaps
 
-    # NOTE: Signa gives pre-generated norm/dead-time sinograms rather than
-    # mMR-style norm components + a runtime get_norm_sino() call — combine
-    # exactly as your read-in script does (nrm * dtpu):
+    # Signa gives pre-generated norm/dead-time sinograms rather than mMR-style
+    # norm components + a runtime get_norm_sino() call -- combine as your
+    # read-in script does (nrm * dtpu):
     nsng = nrmcmp['nrm'] * nrmcmp['dtpu']
+    nsng[:, range(1, 89, 2)] *= 2
 
-    # NOTE: no mmrimg.convert2dev() equivalent shown for Signa — plain combine:
-    mus = cu.asarray(muo + muh, dtype=np.float32)
+    # ── fix mu-map axis order: loader gives (Z,Y,X), projector needs
+    # (SZ_IMY, SZ_IMX, SZ_IMZ) -- confirmed necessary earlier (mu.shape was
+    # (89,288,288) against expected (288,288,89)).
+    def _fix_mumap_axes(mu):
+        mu = np.asarray(mu)
+        if mu.shape == im_shape:
+            return mu
+        mu_fixed = np.transpose(mu, (1, 2, 0))
+        assert mu_fixed.shape == im_shape, (
+            f"mu-map shape {mu.shape} doesn't match im_shape {im_shape} even "
+            f"after (1,2,0) transpose -- got {mu_fixed.shape}."
+        )
+        return mu_fixed
 
-    # forward-project mu-map to get the attenuation sinogram
-    # (0 = TOF bin index / non-TOF, per your script's fprj signature)
-    fwd_mu = cu.zeros(sinog.shape, dtype=np.float32)
-    fwd_mu  = SigForward((pred), mus, scanner_params, hst, False)[1]#psf
+    muh_fixed = _fix_mumap_axes(muh)
+    muo_fixed = _fix_mumap_axes(muo)
+    mus = cu.asarray(muo_fixed + muh_fixed, dtype=np.float32)
+
+    # forward-project the (axis-corrected) mu-map to get the attenuation
+    # sinogram. attenuation=True, matching the mMR original's
+    # Forward(mus, muMaps, scanner_params, hst, True). The previous draft
+    # forward-projected `pred` (not `mus`) with attenuation=False, which
+    # produced a meaningless attenuation sinogram.
+    fwd_mu = SigForward(mus, scanner_params, attenuation=True)
     fwd_mu_gaps = np.array(fwd_mu, dtype=np.float32)
 
     fwhm = 2.5
-    # NOTE: verify these voxel-size keys against your Signa Cnt — PSF stays
-    # disabled below (same as Scatter_BSREM_Updated), so this is unused for now
-    SIGMA2FWHMmm = (8 * np.log(2))**0.5 * np.array([
-        Cnt.get('SZ_VOXY'), Cnt.get('SZ_VOXX', Cnt.get('SZ_VOXY')), Cnt.get('SZ_VOXZ')
-    ]) * 10
+    SIGMA2FWHMmm = (8 * np.log(2))**0.5 * np.array(
+        [Cnt['SO_VX' + i] for i in 'ZYX']) * 10
     psf = functools.partial(gaussian_filter, sigma=fwhm / SIGMA2FWHMmm)
 
-    # NOTE: Signa FOV mask, per your reconstruction script
-    msk = Mask(Cnt)
+    # Signa FOV mask -- SigMask, not Mask (Mask() uses mmrimg.get_cylinder,
+    # which is mMR-specific and would be wrong here).
+    msk = SigMask(Cnt)
     pred[msk] = 0.0
     nsng_fwd = nsng * fwd_mu_gaps
 
     # ── 1. Interleaved subsets ────────────────────────────────────────────
-    # NOTE: sinog is NAW-flattened (bins*angles, nsinos) for Signa, not
-    # (nsinos, angles, bins) like mMR — reshape to expose the angle axis.
-    # VERIFY NSBINS/NSANGLES key names + ordering against your Cnt.
+    # Confirmed correct: reshape(n_bins, n_angles, -1) on the flat (NAW,
+    # nsinos) sinogram matches get_txLUT's iw*NSANGLES + ia indexing (bin
+    # outer, angle inner) -- no further transpose needed here (a .T was
+    # only ever needed for matshow display, not for indexing correctness).
     n_bins   = Cnt['NSBINS']
     n_angles = Cnt['NSANGLES']
     assert n_bins * n_angles == Cnt['NAW'], \
@@ -1129,19 +1121,18 @@ def Signa_BSREM(
         masked_bab[:, idx, :] = to_bab(nsng_fwd)[:, idx, :]
         masked_nsng = to_naw(masked_bab)
 
-        s_sub_arr = cu.zeros(im_shape, dtype=np.float32)
-        nipet.prjsig.bprj(s_sub_arr, cu.asarray(masked_nsng, dtype=np.float32),
-                           txLUT, axLUT, ISUB_DEFAULT, Cnt, sync=True)
-        s_sub = np.array(s_sub_arr)  #psf
+        s_sub_arr = SigBack(masked_nsng, scanner_params)
+
+        s_sub = np.array(s_sub_arr)  # psf
         s_sub[msk] = 0.0
         subset_sensitivities.append(s_sub)
 
-    # ── 3. Additive correction — identical to Scatter_BSREM_Updated ────────
+    # ── 3. Additive correction ──────────────────────────────────────────
     randoms  = div_nzer(randoms, nsng_fwd)
     additive = (cu.asarray(randoms, dtype=np.float32)
                 + cu.asarray(scatter, dtype=np.float32))
 
-    # ── 4. BSREM-specific setup — identical ──────────────────────────────
+    # ── 4. BSREM-specific setup ───────────────────────────────────────────
     if alpha_decay is None:
         alpha_decay = float(n_subsets * iterations) / 3.0
 
@@ -1159,50 +1150,47 @@ def Signa_BSREM(
             s_sub = subset_sensitivities[s]
 
             # ── 5a. Forward projection ────────────────────────────────────
-            fwd_arr = cu.zeros(sinog.shape, dtype=np.float32)
-            nipet.prjsig.fprj(fwd_arr, cu.asarray(pred, dtype=np.float32),
-                               txLUT, axLUT, ISUB_DEFAULT, Cnt, 0, sync=True)
-            fwd = np.array(fwd_arr)  #psf
+            # Fixed: previous draft's return value was discarded (fwd_arr
+            # never assigned), so fwd was always zero. attenuation=False
+            # here since attenuation is already folded into nsng_fwd /
+            # additive / s_sub above.
+            fwd_arr = SigForward(cu.asarray(pred, dtype=np.float32),
+                                  scanner_params, attenuation=False)
+            fwd = np.array(fwd_arr)  # psf
             fwd += additive
             fwd  = np.maximum(fwd, 1e-15)
 
-            # ── 5b. Subset likelihood gradient — identical logic ────────────
+            # ── 5b. Subset likelihood gradient ────────────────────────────
             ratio = div_nzer(sinog, fwd)
             masked_ratio = np.zeros_like(ratio)
             masked_bab = to_bab(masked_ratio)
             masked_bab[:, idx, :] = to_bab(ratio)[:, idx, :]
             masked_ratio = to_naw(masked_bab)
 
-            bp_ratio_arr = cu.zeros(im_shape, dtype=np.float32)
-            nipet.prjsig.bprj(bp_ratio_arr, cu.asarray(masked_ratio, dtype=np.float32),
-                               txLUT, axLUT, ISUB_DEFAULT, Cnt, sync=True)
-            bp_ratio = np.array(bp_ratio_arr)  #psf
+            bp_ratio_arr = SigBack(masked_ratio, scanner_params)
+            bp_ratio = np.array(bp_ratio_arr)  # psf
 
             grad_L = bp_ratio - s_sub
 
-            # ── 5c. RDP prior gradient — identical ───────────────────────────
+            # ── 5c. RDP prior gradient ────────────────────────────────────
             grad_R = gradient(pred, gamma, beta) / n_subsets
 
-            # ── 5d. EM preconditioner — identical ────────────────────────────
+            # ── 5d. EM preconditioner ────────────────────────────────────
             delta = max(float(delta_frac * float(pred.max())), 1e-8)
             D_s = (pred + delta) / np.maximum(s_sub, 1e-15)
             D_s[msk] = 0.0
 
-            # ── 5e. BSREM update — identical ──────────────────────────────────
+            # ── 5e. BSREM update ──────────────────────────────────────────
             pred = pred + alpha * D_s * (grad_L + grad_R)
             pred = np.maximum(pred, 0.0)
             pred[msk] = 0.0
 
             global_subit += 1
 
-        # ── 6. Optional scatter re-estimation ────────────────────────────
         if len(scatterinp) != 0:
-            # NOTE: no Signa Scatter() equivalent was provided — plug yours
-            # in here, or leave scatterinp fixed for the whole run.
-            raise NotImplementedError(
-                "Signa scatter re-estimation not implemented; provide a "
-                "Signa Scatter() equivalent or omit scatterinp."
-            )
+            scatter  = Scatter(datain, muMaps, scanner_params, hst, randoms, pred)
+            additive = (cu.asarray(randoms, dtype=np.float32)
+                        + cu.asarray(scatter, dtype=np.float32))
 
         print(f"\x1b[31m\"Iter {i+1:4d} | alpha={_alpha(global_subit, alpha_0, alpha_decay):.5f}"
               f"| pred min/max/mean: {float(pred.min()):.4f} / {float(pred.max()):.4f} / {float(pred.mean()):.4f}\"\x1b[0m")
